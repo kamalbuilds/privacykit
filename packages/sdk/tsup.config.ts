@@ -9,5 +9,15 @@ export default defineConfig({
   splitting: false,
   treeshake: true,
   minify: false,
-  external: ['@solana/web3.js'],
+  external: [
+    '@solana/web3.js',
+    '@noir-lang/noir_js',
+    '@noir-lang/backend_barretenberg',
+    '@noir-lang/types',
+    '@arcium-hq/client',
+    '@arcium-hq/reader',
+    'circomlibjs',
+    'snarkjs',
+    'ffjavascript',
+  ],
 });

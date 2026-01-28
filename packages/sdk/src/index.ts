@@ -131,3 +131,222 @@ export {
   isBrowser,
   isWasmSupported,
 } from './utils';
+
+// Noir ZK Proving System
+export {
+  // Compiler
+  NoirCompiler,
+  CIRCUIT_DEFINITIONS,
+  defaultCompiler,
+  createCompiler,
+  formatInputs,
+
+  // Prover
+  NoirProver,
+  getDefaultProver,
+  createProver,
+  generatePrivateTransferProof,
+  generateBalanceThresholdProof,
+  generateOwnershipProof,
+
+  // Verifier
+  NoirVerifier,
+  SUNSPOT_VERIFIER_PROGRAM_ID,
+  getDefaultVerifier,
+  createVerifier,
+  verifyProofQuick,
+} from './noir';
+
+export type {
+  CircuitMetadata,
+  CompiledCircuitArtifact,
+  CompileOptions,
+  ProofResult,
+  ProverConfig,
+  VerificationResult,
+  OnChainVerifierConfig,
+} from './noir';
+
+// ShadowPay/ShadowWire API Client
+export {
+  // API Client
+  ShadowPayApiClient,
+  ShadowPayApiErrorClass,
+  createShadowPayClient,
+  DEFAULT_CIRCUIT_URLS,
+  SHADOWPAY_PROGRAM_ID,
+  SHADOWPAY_TOKENS,
+
+  // Authentication
+  SHADOWPAY_API_URL,
+  API_VERSION,
+  createAuthHeaders,
+  createSignedMessage,
+  createTransferPayload,
+  verifyAccessToken,
+  createPaymentRequirementHeader,
+  parsePaymentRequirementHeader,
+  verifyWebhookSignature,
+  errorCodeToStatus,
+  isRateLimited,
+  getRetryAfter,
+
+  // Types
+  ShadowPayErrorCode,
+  type ShadowPayToken,
+  type TokenConfig,
+  type PaymentRequirement,
+  type PaymentVerification,
+  type PaymentRequest,
+  type PaymentResult,
+  type WebhookEvent,
+  type WebhookEventType,
+  type PrivateTransferRequest,
+  type PrivateTransferResponse,
+  type DepositRequest as ShadowPayDepositRequest,
+  type DepositResponse,
+  type WithdrawalRequest,
+  type WithdrawalResponse,
+  type BalanceResponse,
+  type ShadowPayClientConfig,
+  type ShadowPayInitOptions,
+  type CircuitUrls,
+  type ElGamalKeypair,
+  type EncryptedAmount,
+  type ZKProof,
+  type PaymentCommitment,
+  type AuthHeaders,
+} from './shadowwire';
+
+// Arcium MPC Confidential Computing
+export {
+  // Client
+  ArciumClient,
+  createDevnetClient,
+  createMainnetClient,
+  compDefOffset,
+
+  // C-SPL Tokens
+  CSPLTokenClient,
+  CSPL_PROGRAM_IDS,
+  CSPL_TOKEN_CONFIGS,
+  createCSPLClient,
+
+  // Encryption
+  X25519,
+  RescueCipher,
+  CSPLRescueCipher,
+  AesCipher,
+  ArciumEncryption,
+  serializeLE,
+  deserializeLE,
+  sha256,
+  positiveModulo,
+
+  // Types
+  type ArciumCluster,
+  type ArciumProgramAddresses,
+  type ClusterConfig,
+  type MXEAccount,
+  type ComputationDefinition,
+  type ComputationAccount,
+  type ComputationResult,
+  type EncryptedValue,
+  type CSPLTokenConfig,
+  type ConfidentialTokenAccount,
+  type ConfidentialTransferRequest,
+  type ShieldRequest,
+  type UnshieldRequest,
+  type MempoolAccount,
+  type ExecutingPoolAccount,
+  type MempoolPriorityFeeStats,
+  type ARXNodeInfo,
+  type ClusterAccount,
+  type CallbackConfig,
+  type QueueComputationParams,
+  type ArciumClientConfig,
+  type X25519KeyPair,
+  type RescueCipherParams,
+  type FieldInfo,
+  type Packer,
+
+  // Enums
+  MXEStatus,
+  ComputationStatus,
+  ConfidentialAccountState,
+  EncryptionOwner,
+  ArciumErrorType,
+
+  // Constants
+  CLUSTER_OFFSETS,
+  RESCUE_CIPHER_CONFIG,
+  CURVE25519_CONSTANTS,
+
+  // Errors
+  ArciumError,
+} from './arcium';
+
+// Privacy Cash ZK Privacy Pool
+export {
+  // Poseidon Hash
+  initPoseidon,
+  poseidonHash,
+  poseidonHashSingle,
+  poseidonHashMany,
+  bytesToField,
+  fieldToBytes,
+  fieldToHex,
+  hexToField,
+  randomFieldElement,
+  isValidFieldElement,
+  SNARK_FIELD_SIZE,
+  type PoseidonFn,
+
+  // Merkle Tree
+  IncrementalMerkleTree,
+  createMerkleTree,
+  verifyMerkleProof,
+  computeRootFromProof,
+  batchInsert,
+  initZeroValues,
+  getZeroValue,
+  DEFAULT_TREE_DEPTH,
+
+  // Commitment
+  generateDepositNote,
+  regenerateCommitment,
+  verifyNote,
+  encodeNote,
+  decodeNote,
+  createNoteFromParams,
+  generateDeterministicNote,
+  splitIntoNotes,
+  computeStealthCommitment,
+
+  // ZK Prover
+  initProver,
+  isRealProvingAvailable,
+  generateWithdrawalProof,
+  verifyWithdrawalProof,
+  serializeProof,
+  deserializeProof,
+  estimateProofTime,
+  getProverStatus,
+
+  // Types
+  type DepositNote as PrivacyCashDepositNote,
+  type EncodedNote,
+  type MerkleProof,
+  type Groth16Proof,
+  type WithdrawalPublicSignals,
+  type WithdrawalProof,
+  type WithdrawalCircuitInputs,
+  type VerificationKey as PrivacyCashVerificationKey,
+  type PoolConfig as PrivacyCashPoolConfig,
+  type PoolState,
+  type CircuitArtifacts,
+  type ProverConfig as PrivacyCashProverConfig,
+  type RelayerInfo,
+  type DepositEvent,
+  type WithdrawalEvent,
+} from './privacycash';

@@ -1,3 +1,16 @@
+/**
+ * Arcium Adapter
+ *
+ * Production integration with Arcium's Multi-Party Computation network
+ * for fully encrypted DeFi operations on Solana.
+ *
+ * Features:
+ * - C-SPL (Confidential SPL) token support with encrypted balances
+ * - Multi-party computation for confidential state transitions
+ * - Confidential swaps, transfers, and DeFi operations
+ * - Compatible with Anchor development patterns
+ * - Uses real Arcium program IDs and encryption protocols
+ */
 import {
   Connection,
   PublicKey,
@@ -5,6 +18,7 @@ import {
   TransactionInstruction,
   SystemProgram,
   LAMPORTS_PER_SOL,
+  type TransactionSignature,
 } from '@solana/web3.js';
 import type {
   TransferRequest,
@@ -15,74 +29,71 @@ import type {
   WithdrawResult,
   EstimateRequest,
   EstimateResult,
+  WalletAdapter,
 } from '../types';
 import { PrivacyProvider, PrivacyLevel } from '../types';
 import { BaseAdapter } from './base';
+import { wrapError } from '../utils/errors';
 import {
-  TransactionError,
-  NetworkError,
-  wrapError,
-} from '../utils/errors';
-import { retry, randomBytes, bytesToHex } from '../utils';
+  ArciumClient,
+  CSPLTokenClient,
+  CSPL_TOKEN_CONFIGS,
+  CSPL_PROGRAM_IDS,
+  type ArciumClientConfig,
+  type EncryptedValue,
+  type MempoolPriorityFeeStats,
+  CLUSTER_OFFSETS,
+  ArciumError,
+  ArciumErrorType,
+} from '../arcium';
 
 /**
- * Arcium Program IDs (Devnet)
- * These are the deployed Arcium MPC program addresses
+ * Arcium network RPC endpoints
  */
-const ARCIUM_PROGRAM_IDS = {
-  devnet: {
-    mpc: new PublicKey('ArciumMPC111111111111111111111111111111111'),
-    cspl: new PublicKey('ArcCSPL1111111111111111111111111111111111'),
-    registry: new PublicKey('ArcReg11111111111111111111111111111111111'),
-  },
-  'mainnet-beta': {
-    mpc: new PublicKey('ArciumMPC111111111111111111111111111111111'),
-    cspl: new PublicKey('ArcCSPL1111111111111111111111111111111111'),
-    registry: new PublicKey('ArcReg11111111111111111111111111111111111'),
-  },
+const ARCIUM_RPC_ENDPOINTS = {
+  devnet: 'https://api.devnet.solana.com',
+  'mainnet-beta': 'https://api.mainnet-beta.solana.com',
+} as const;
+
+/**
+ * Supported tokens for Arcium C-SPL operations
+ */
+const SUPPORTED_TOKENS = Object.keys(CSPL_TOKEN_CONFIGS);
+
+/**
+ * Fee structure for Arcium operations (in percentage)
+ */
+const FEE_STRUCTURE: {
+  transfer: number;
+  shield: number;
+  unshield: number;
+  priorityFeeBase: number;
+} = {
+  transfer: 0.002, // 0.2%
+  shield: 0.001, // 0.1%
+  unshield: 0.001, // 0.1%
+  priorityFeeBase: 5000, // Base priority fee in lamports
 };
 
 /**
- * Arcium C-SPL token configuration
- * Confidential SPL tokens that support encrypted balances
+ * Latency estimates for different operations (in milliseconds)
+ * MPC operations require coordination with multiple nodes
  */
-interface CSPLTokenConfig {
-  mint: PublicKey;
-  decimals: number;
-  confidentialMint?: PublicKey;
-}
-
-const CSPL_TOKENS: Record<string, CSPLTokenConfig> = {
-  SOL: {
-    mint: new PublicKey('So11111111111111111111111111111111111111112'),
-    decimals: 9,
-  },
-  USDC: {
-    mint: new PublicKey('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'),
-    decimals: 6,
-  },
-};
-
-/**
- * Arcium MPC state for encrypted computations
- */
-interface MPCState {
-  nodeId: string;
-  sessionId: string;
-  encryptedState: Uint8Array;
-}
+const LATENCY_ESTIMATES = {
+  transfer: 8000, // MPC coordination for encrypted transfer
+  shield: 4000, // Simpler operation - just wrapping
+  unshield: 6000, // MPC verification of encrypted balance
+  prove: 10000, // Full MPC computation
+} as const;
 
 /**
  * Arcium Adapter
  *
- * Real production integration with Arcium's MPC network for
- * fully encrypted DeFi operations.
- *
- * Features:
- * - C-SPL (Confidential SPL) token support
- * - Multi-party computation for encrypted state
- * - Confidential swaps, transfers, and DeFi operations
- * - Compatible with Anchor development patterns
+ * Production-ready adapter for Arcium's MPC network providing:
+ * - Confidential token transfers with hidden amounts
+ * - Shield/unshield operations for C-SPL tokens
+ * - Encrypted balance management
+ * - MPC-based confidential computation
  */
 export class ArciumAdapter extends BaseAdapter {
   readonly provider = PrivacyProvider.ARCIUM;
@@ -92,89 +103,136 @@ export class ArciumAdapter extends BaseAdapter {
     PrivacyLevel.AMOUNT_HIDDEN,
     PrivacyLevel.SENDER_HIDDEN,
   ];
-  readonly supportedTokens = Object.keys(CSPL_TOKENS);
+  readonly supportedTokens = SUPPORTED_TOKENS;
 
-  private programIds = ARCIUM_PROGRAM_IDS.devnet;
-  private mpcSession: MPCState | null = null;
+  private arciumClient: ArciumClient | null = null;
+  private csplClient: CSPLTokenClient | null = null;
   private network: 'devnet' | 'mainnet-beta' = 'devnet';
+  private clusterOffset: number = CLUSTER_OFFSETS.DEVNET_V063;
 
   /**
    * Initialize Arcium adapter
+   * Establishes connection to Arcium MPC network and fetches MXE public key
    */
   protected async onInitialize(): Promise<void> {
-    // Determine network from connection
-    const genesisHash = await this.connection!.getGenesisHash();
+    if (!this.connection) {
+      throw new ArciumError(ArciumErrorType.NetworkError, 'Connection not available');
+    }
 
-    // Mainnet genesis hash
-    if (genesisHash === '5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d') {
-      this.network = 'mainnet-beta';
-      this.programIds = ARCIUM_PROGRAM_IDS['mainnet-beta'];
-    } else {
+    // Determine network from connection
+    try {
+      const genesisHash = await this.connection.getGenesisHash();
+
+      // Mainnet genesis hash
+      if (genesisHash === '5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d') {
+        this.network = 'mainnet-beta';
+        this.clusterOffset = CLUSTER_OFFSETS.MAINNET;
+      } else {
+        this.network = 'devnet';
+        this.clusterOffset = CLUSTER_OFFSETS.DEVNET_V063;
+      }
+    } catch {
+      // Default to devnet if genesis hash check fails
       this.network = 'devnet';
-      this.programIds = ARCIUM_PROGRAM_IDS.devnet;
+      this.clusterOffset = CLUSTER_OFFSETS.DEVNET_V063;
+    }
+
+    // Get RPC URL from connection or use default
+    const rpcUrl = ARCIUM_RPC_ENDPOINTS[this.network];
+
+    // Initialize Arcium client
+    const config: ArciumClientConfig = {
+      cluster: this.network,
+      clusterOffset: this.clusterOffset,
+      rpcUrl,
+      commitment: 'confirmed',
+    };
+
+    this.arciumClient = new ArciumClient(config);
+
+    // Set wallet if available
+    if (this.wallet) {
+      this.arciumClient.setWallet(this.wallet);
+    }
+
+    // Initialize client and fetch MXE public key
+    try {
+      await this.arciumClient.initialize();
+    } catch (error) {
+      this.logger.warn('Failed to fetch MXE public key - some operations may be limited', error);
+      // Continue anyway - some read operations can still work
+    }
+
+    // Initialize C-SPL client
+    this.csplClient = new CSPLTokenClient(this.arciumClient);
+    if (this.wallet) {
+      this.csplClient.setWallet(this.wallet);
     }
 
     this.logger.info(`Arcium adapter initialized on ${this.network}`);
+    this.logger.info(`  Cluster offset: ${this.clusterOffset}`);
+    this.logger.info(`  Supported tokens: ${SUPPORTED_TOKENS.join(', ')}`);
   }
 
   /**
-   * Initialize an MPC session for encrypted operations
+   * Update wallet reference
    */
-  private async initMPCSession(): Promise<MPCState> {
-    if (this.mpcSession) {
-      return this.mpcSession;
+  setWallet(wallet: WalletAdapter): void {
+    super.setWallet(wallet);
+    if (this.arciumClient) {
+      this.arciumClient.setWallet(wallet);
     }
-
-    const sessionId = bytesToHex(randomBytes(16));
-    const nodeId = `arcium-node-${Date.now()}`;
-
-    this.mpcSession = {
-      nodeId,
-      sessionId,
-      encryptedState: new Uint8Array(0),
-    };
-
-    this.logger.debug(`MPC session initialized: ${sessionId}`);
-    return this.mpcSession;
+    if (this.csplClient) {
+      this.csplClient.setWallet(wallet);
+    }
   }
 
   /**
    * Get confidential balance for a token
-   * Uses MPC to decrypt balance without revealing to network
+   * Uses the connected wallet's encryption key to decrypt the balance
    */
   async getBalance(token: string, address?: string): Promise<number> {
     this.ensureReady();
 
     const walletAddress = address || this.wallet?.publicKey.toBase58();
     if (!walletAddress) {
-      throw new Error('No wallet address provided');
+      throw new ArciumError(ArciumErrorType.InvalidInput, 'No wallet address provided');
     }
 
-    const tokenConfig = CSPL_TOKENS[token.toUpperCase()];
+    const tokenUpper = token.toUpperCase();
+    const tokenConfig = CSPL_TOKEN_CONFIGS[tokenUpper];
+
     if (!tokenConfig) {
-      throw new Error(`Token ${token} not supported by Arcium`);
+      throw new ArciumError(ArciumErrorType.InvalidInput, `Token ${token} not supported by Arcium`);
     }
 
     try {
-      // For C-SPL tokens, we need to query the confidential balance
-      // This involves decrypting the encrypted balance using MPC
-
-      const connection = this.getConnection();
-      const pubkey = new PublicKey(walletAddress);
-
-      // Get associated token account
-      const tokenAccounts = await connection.getTokenAccountsByOwner(pubkey, {
-        mint: tokenConfig.mint,
-      });
-
-      if (tokenAccounts.value.length === 0) {
-        return 0;
+      // If querying for connected wallet, use C-SPL client to decrypt balance
+      if (this.csplClient && this.wallet && walletAddress === this.wallet.publicKey.toBase58()) {
+        return await this.csplClient.getBalance(tokenUpper);
       }
 
-      // For now, return the regular balance
-      // Full C-SPL implementation would decrypt the confidential balance
-      const balance = await connection.getBalance(pubkey);
-      return balance / LAMPORTS_PER_SOL;
+      // For other addresses, we can only return the encrypted balance exists or not
+      const ownerPubkey = new PublicKey(walletAddress);
+      const accountInfo = await this.csplClient?.getConfidentialAccountInfo(
+        ownerPubkey,
+        tokenConfig.mint
+      );
+
+      if (accountInfo) {
+        // Account exists but we can't decrypt it
+        this.logger.debug(`Confidential account exists for ${walletAddress} but balance is encrypted`);
+        return -1; // Indicate encrypted balance exists
+      }
+
+      // No confidential account - check regular balance
+      const connection = this.getConnection();
+      if (tokenUpper === 'SOL') {
+        const balance = await connection.getBalance(new PublicKey(walletAddress));
+        return balance / LAMPORTS_PER_SOL;
+      }
+
+      return 0;
     } catch (error) {
       throw wrapError(error, 'Failed to get Arcium balance');
     }
@@ -182,17 +240,21 @@ export class ArciumAdapter extends BaseAdapter {
 
   /**
    * Execute a confidential transfer via Arcium MPC
+   * Amount and balance changes are hidden from observers
    */
   async transfer(request: TransferRequest): Promise<TransferResult> {
     this.ensureReady();
     const wallet = this.ensureWallet();
-    const connection = this.getConnection();
+
+    if (!this.arciumClient || !this.csplClient) {
+      throw new ArciumError(ArciumErrorType.NetworkError, 'Arcium client not initialized');
+    }
 
     const token = request.token.toUpperCase();
-    const tokenConfig = CSPL_TOKENS[token];
+    const tokenConfig = CSPL_TOKEN_CONFIGS[token];
 
     if (!tokenConfig) {
-      throw new Error(`Token ${request.token} not supported by Arcium`);
+      throw new ArciumError(ArciumErrorType.InvalidInput, `Token ${request.token} not supported by Arcium`);
     }
 
     const recipient =
@@ -203,50 +265,28 @@ export class ArciumAdapter extends BaseAdapter {
     this.logger.info(`Initiating confidential transfer of ${request.amount} ${token}`);
 
     try {
-      // Initialize MPC session
-      const session = await this.initMPCSession();
+      // Encrypt the transfer amount
+      const encryptedAmount = this.csplClient.encryptAmount(request.amount, tokenConfig.mint);
 
-      // Create confidential transfer instruction
-      // This encrypts the amount and recipient using MPC
-      const instruction = await this.createConfidentialTransferInstruction(
-        wallet.publicKey,
+      // Execute confidential transfer
+      const signature = await this.csplClient.confidentialTransfer({
+        sender: wallet.publicKey,
         recipient,
-        request.amount,
-        tokenConfig,
-        session
-      );
-
-      // Build and send transaction
-      const transaction = new Transaction();
-      transaction.add(instruction);
-
-      const { blockhash, lastValidBlockHeight } =
-        await connection.getLatestBlockhash();
-      transaction.recentBlockhash = blockhash;
-      transaction.feePayer = wallet.publicKey;
-
-      // Sign transaction
-      const signedTx = await wallet.signTransaction(transaction);
-
-      // Send and confirm
-      const signature = await connection.sendRawTransaction(signedTx.serialize(), {
-        skipPreflight: false,
-        maxRetries: 3,
+        encryptedAmount,
+        mint: tokenConfig.mint,
       });
 
-      await connection.confirmTransaction(
-        { signature, blockhash, lastValidBlockHeight },
-        'confirmed'
-      );
-
       this.logger.info(`Confidential transfer complete: ${signature}`);
+
+      // Calculate fee
+      const fee = request.amount * FEE_STRUCTURE.transfer;
 
       return {
         signature,
         provider: this.provider,
         privacyLevel: PrivacyLevel.FULL_ENCRYPTED,
-        fee: 0.002 * request.amount, // 0.2% fee
-        anonymitySet: 1000, // MPC provides theoretical infinite anonymity set
+        fee,
+        anonymitySet: undefined, // MPC provides computational privacy, not anonymity set
       };
     } catch (error) {
       throw wrapError(error, 'Arcium confidential transfer failed');
@@ -254,107 +294,51 @@ export class ArciumAdapter extends BaseAdapter {
   }
 
   /**
-   * Create a confidential transfer instruction
-   */
-  private async createConfidentialTransferInstruction(
-    sender: PublicKey,
-    recipient: PublicKey,
-    amount: number,
-    tokenConfig: CSPLTokenConfig,
-    session: MPCState
-  ): Promise<TransactionInstruction> {
-    // Encrypt amount using MPC
-    const encryptedAmount = await this.encryptAmount(amount, session);
-
-    // Build instruction data
-    const instructionData = Buffer.alloc(1 + 32 + 32 + encryptedAmount.length);
-    instructionData.writeUInt8(0x01, 0); // Confidential transfer instruction
-    sender.toBuffer().copy(instructionData, 1);
-    recipient.toBuffer().copy(instructionData, 33);
-    Buffer.from(encryptedAmount).copy(instructionData, 65);
-
-    return new TransactionInstruction({
-      programId: this.programIds.cspl,
-      keys: [
-        { pubkey: sender, isSigner: true, isWritable: true },
-        { pubkey: recipient, isSigner: false, isWritable: true },
-        { pubkey: tokenConfig.mint, isSigner: false, isWritable: false },
-        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-      ],
-      data: instructionData,
-    });
-  }
-
-  /**
-   * Encrypt an amount using MPC
-   * In production, this would coordinate with Arcium MPC nodes
-   */
-  private async encryptAmount(amount: number, session: MPCState): Promise<Uint8Array> {
-    // Convert amount to bytes
-    const amountBuffer = Buffer.alloc(8);
-    amountBuffer.writeBigUInt64LE(BigInt(Math.floor(amount * 1e9)));
-
-    // In production, this would:
-    // 1. Split amount into shares
-    // 2. Distribute to MPC nodes
-    // 3. Get encrypted ciphertext back
-
-    // For now, create a placeholder encrypted amount
-    const nonce = randomBytes(12);
-    const ciphertext = new Uint8Array(amountBuffer.length + nonce.length + 16);
-    ciphertext.set(nonce, 0);
-    ciphertext.set(amountBuffer, nonce.length);
-    // Tag would be added by actual encryption
-
-    return ciphertext;
-  }
-
-  /**
    * Shield tokens into Arcium confidential pool
+   * Converts regular SPL tokens to C-SPL tokens with encrypted balances
    */
   async deposit(request: DepositRequest): Promise<DepositResult> {
     this.ensureReady();
     const wallet = this.ensureWallet();
-    const connection = this.getConnection();
+
+    if (!this.csplClient) {
+      throw new ArciumError(ArciumErrorType.NetworkError, 'C-SPL client not initialized');
+    }
 
     const token = request.token.toUpperCase();
-    const tokenConfig = CSPL_TOKENS[token];
+    const tokenConfig = CSPL_TOKEN_CONFIGS[token];
 
     if (!tokenConfig) {
-      throw new Error(`Token ${request.token} not supported by Arcium`);
+      throw new ArciumError(ArciumErrorType.InvalidInput, `Token ${request.token} not supported by Arcium`);
     }
 
     this.logger.info(`Shielding ${request.amount} ${token} into Arcium`);
 
     try {
-      // Create shield instruction to convert regular tokens to C-SPL
-      const shieldInstruction = this.createShieldInstruction(
+      // Ensure confidential account is initialized
+      const accountInfo = await this.csplClient.getConfidentialAccountInfo(
         wallet.publicKey,
-        request.amount,
-        tokenConfig
+        tokenConfig.mint
       );
 
-      const transaction = new Transaction().add(shieldInstruction);
+      if (!accountInfo) {
+        this.logger.info('Initializing confidential account...');
+        await this.csplClient.initializeConfidentialAccount(tokenConfig.mint);
+      }
 
-      const { blockhash, lastValidBlockHeight } =
-        await connection.getLatestBlockhash();
-      transaction.recentBlockhash = blockhash;
-      transaction.feePayer = wallet.publicKey;
-
-      const signedTx = await wallet.signTransaction(transaction);
-      const signature = await connection.sendRawTransaction(signedTx.serialize());
-
-      await connection.confirmTransaction(
-        { signature, blockhash, lastValidBlockHeight },
-        'confirmed'
-      );
+      // Shield tokens
+      const signature = await this.csplClient.shield({
+        sourceAccount: wallet.publicKey,
+        amount: request.amount,
+        mint: tokenConfig.mint,
+      });
 
       this.logger.info(`Shield complete: ${signature}`);
 
       return {
         signature,
         provider: this.provider,
-        fee: 0.002 * request.amount,
+        fee: request.amount * FEE_STRUCTURE.shield,
       };
     } catch (error) {
       throw wrapError(error, 'Arcium shield operation failed');
@@ -362,41 +346,22 @@ export class ArciumAdapter extends BaseAdapter {
   }
 
   /**
-   * Create shield instruction
-   */
-  private createShieldInstruction(
-    owner: PublicKey,
-    amount: number,
-    tokenConfig: CSPLTokenConfig
-  ): TransactionInstruction {
-    const data = Buffer.alloc(9);
-    data.writeUInt8(0x02, 0); // Shield instruction
-    data.writeBigUInt64LE(BigInt(Math.floor(amount * Math.pow(10, tokenConfig.decimals))), 1);
-
-    return new TransactionInstruction({
-      programId: this.programIds.cspl,
-      keys: [
-        { pubkey: owner, isSigner: true, isWritable: true },
-        { pubkey: tokenConfig.mint, isSigner: false, isWritable: true },
-        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-      ],
-      data,
-    });
-  }
-
-  /**
    * Unshield tokens from Arcium confidential pool
+   * Converts C-SPL tokens back to regular SPL tokens
    */
   async withdraw(request: WithdrawRequest): Promise<WithdrawResult> {
     this.ensureReady();
     const wallet = this.ensureWallet();
-    const connection = this.getConnection();
+
+    if (!this.csplClient) {
+      throw new ArciumError(ArciumErrorType.NetworkError, 'C-SPL client not initialized');
+    }
 
     const token = request.token.toUpperCase();
-    const tokenConfig = CSPL_TOKENS[token];
+    const tokenConfig = CSPL_TOKEN_CONFIGS[token];
 
     if (!tokenConfig) {
-      throw new Error(`Token ${request.token} not supported by Arcium`);
+      throw new ArciumError(ArciumErrorType.InvalidInput, `Token ${request.token} not supported by Arcium`);
     }
 
     const recipient =
@@ -407,64 +372,22 @@ export class ArciumAdapter extends BaseAdapter {
     this.logger.info(`Unshielding ${request.amount} ${token} from Arcium`);
 
     try {
-      const unshieldInstruction = this.createUnshieldInstruction(
-        wallet.publicKey,
-        recipient,
-        request.amount,
-        tokenConfig
-      );
-
-      const transaction = new Transaction().add(unshieldInstruction);
-
-      const { blockhash, lastValidBlockHeight } =
-        await connection.getLatestBlockhash();
-      transaction.recentBlockhash = blockhash;
-      transaction.feePayer = wallet.publicKey;
-
-      const signedTx = await wallet.signTransaction(transaction);
-      const signature = await connection.sendRawTransaction(signedTx.serialize());
-
-      await connection.confirmTransaction(
-        { signature, blockhash, lastValidBlockHeight },
-        'confirmed'
-      );
+      const signature = await this.csplClient.unshield({
+        destinationAccount: recipient,
+        amount: request.amount,
+        mint: tokenConfig.mint,
+      });
 
       this.logger.info(`Unshield complete: ${signature}`);
 
       return {
         signature,
         provider: this.provider,
-        fee: 0.002 * request.amount,
+        fee: request.amount * FEE_STRUCTURE.unshield,
       };
     } catch (error) {
       throw wrapError(error, 'Arcium unshield operation failed');
     }
-  }
-
-  /**
-   * Create unshield instruction
-   */
-  private createUnshieldInstruction(
-    owner: PublicKey,
-    recipient: PublicKey,
-    amount: number,
-    tokenConfig: CSPLTokenConfig
-  ): TransactionInstruction {
-    const data = Buffer.alloc(41);
-    data.writeUInt8(0x03, 0); // Unshield instruction
-    recipient.toBuffer().copy(data, 1);
-    data.writeBigUInt64LE(BigInt(Math.floor(amount * Math.pow(10, tokenConfig.decimals))), 33);
-
-    return new TransactionInstruction({
-      programId: this.programIds.cspl,
-      keys: [
-        { pubkey: owner, isSigner: true, isWritable: true },
-        { pubkey: recipient, isSigner: false, isWritable: true },
-        { pubkey: tokenConfig.mint, isSigner: false, isWritable: true },
-        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-      ],
-      data,
-    });
   }
 
   /**
@@ -474,7 +397,7 @@ export class ArciumAdapter extends BaseAdapter {
     const token = (request.token || 'SOL').toUpperCase();
     const amount = request.amount || 0;
 
-    if (!CSPL_TOKENS[token]) {
+    if (!CSPL_TOKEN_CONFIGS[token]) {
       return {
         fee: 0,
         provider: this.provider,
@@ -483,49 +406,174 @@ export class ArciumAdapter extends BaseAdapter {
       };
     }
 
-    // Arcium MPC operations have higher latency due to multi-party coordination
-    const latencyMs =
-      request.operation === 'transfer' ? 8000 : // MPC coordination
-      request.operation === 'deposit' ? 5000 :
-      request.operation === 'withdraw' ? 6000 :
-      3000;
+    // Get mempool priority fee stats if client is initialized
+    let priorityFee = FEE_STRUCTURE.priorityFeeBase;
+    if (this.arciumClient) {
+      try {
+        const feeStats = await this.arciumClient.getMempoolPriorityFeeStats();
+        priorityFee = Number(feeStats.median) || FEE_STRUCTURE.priorityFeeBase;
+      } catch {
+        // Use base priority fee if stats unavailable
+      }
+    }
 
-    const feePercent = 0.002; // 0.2%
-    const fee = amount * feePercent;
+    // Calculate operation fee
+    const feePercent =
+      request.operation === 'transfer' ? FEE_STRUCTURE.transfer :
+      request.operation === 'deposit' ? FEE_STRUCTURE.shield :
+      request.operation === 'withdraw' ? FEE_STRUCTURE.unshield :
+      0;
+
+    const operationFee = amount * feePercent;
+    const priorityFeeSOL = priorityFee / LAMPORTS_PER_SOL;
+    const totalFee = operationFee + priorityFeeSOL;
+
+    // Get latency estimate
+    const latencyMs =
+      LATENCY_ESTIMATES[request.operation as keyof typeof LATENCY_ESTIMATES] || 5000;
+
+    const warnings: string[] = [];
+
+    // Check if token has confidential transfers enabled
+    const tokenConfig = CSPL_TOKEN_CONFIGS[token];
+    if (tokenConfig && !tokenConfig.confidentialTransferEnabled) {
+      warnings.push(`${token} does not support confidential transfers yet`);
+    }
 
     return {
-      fee,
-      tokenFee: fee,
+      fee: totalFee,
+      tokenFee: operationFee,
       provider: this.provider,
       latencyMs,
       anonymitySet: undefined, // MPC provides computational privacy, not anonymity set
-      warnings: [],
+      warnings,
     };
   }
 
   /**
-   * Execute a confidential computation
-   * This is a key feature of Arcium - arbitrary encrypted compute
+   * Execute a confidential computation on Arcium MPC network
+   * Allows arbitrary encrypted computations
    */
   async confidentialCompute<T>(
-    computation: (encryptedInputs: Uint8Array[]) => Promise<Uint8Array>,
-    inputs: unknown[]
+    compDefOffset: number,
+    encryptedInputs: Uint8Array,
+    priorityFee?: bigint
   ): Promise<T> {
-    const session = await this.initMPCSession();
+    this.ensureReady();
 
-    // Encrypt inputs
-    const encryptedInputs = await Promise.all(
-      inputs.map(async (input) => {
-        const buffer = Buffer.from(JSON.stringify(input));
-        return this.encryptAmount(buffer.length, session);
-      })
+    if (!this.arciumClient) {
+      throw new ArciumError(ArciumErrorType.NetworkError, 'Arcium client not initialized');
+    }
+
+    // Get recommended priority fee if not provided
+    let fee = priorityFee;
+    if (!fee) {
+      const feeStats = await this.arciumClient.getMempoolPriorityFeeStats();
+      fee = feeStats.median || BigInt(FEE_STRUCTURE.priorityFeeBase);
+    }
+
+    // Queue computation
+    const signature = await this.arciumClient.queueComputation({
+      compDefOffset,
+      encryptedInputs,
+      priorityFee: fee,
+    });
+
+    this.logger.info(`Computation queued: ${signature}`);
+
+    // Wait for computation to finalize
+    // Generate a computation ID from the signature
+    const computationId = new Uint8Array(32);
+    const sigBytes = Buffer.from(signature, 'base64');
+    sigBytes.copy(Buffer.from(computationId.buffer), 0, 0, 32);
+
+    const result = await this.arciumClient.awaitComputationFinalization<T>(
+      computationId,
+      60000 // 1 minute timeout
     );
 
-    // Execute computation on encrypted data
-    const encryptedResult = await computation(encryptedInputs);
+    return result.output;
+  }
 
-    // Decrypt result (would use MPC in production)
-    // For now, return a placeholder
-    return JSON.parse(Buffer.from(encryptedResult).toString()) as T;
+  /**
+   * Encrypt data for MPC computation
+   */
+  encrypt<T>(value: T): EncryptedValue<T> {
+    if (!this.arciumClient) {
+      throw new ArciumError(ArciumErrorType.NetworkError, 'Arcium client not initialized');
+    }
+    return this.arciumClient.encrypt(value);
+  }
+
+  /**
+   * Decrypt data from MPC computation result
+   */
+  decrypt<T>(encrypted: EncryptedValue<T>): T {
+    if (!this.arciumClient) {
+      throw new ArciumError(ArciumErrorType.NetworkError, 'Arcium client not initialized');
+    }
+    return this.arciumClient.decrypt(encrypted);
+  }
+
+  /**
+   * Get the underlying Arcium client
+   */
+  getArciumClient(): ArciumClient | null {
+    return this.arciumClient;
+  }
+
+  /**
+   * Get the C-SPL token client
+   */
+  getCSPLClient(): CSPLTokenClient | null {
+    return this.csplClient;
+  }
+
+  /**
+   * Get current network
+   */
+  getNetwork(): 'devnet' | 'mainnet-beta' {
+    return this.network;
+  }
+
+  /**
+   * Get cluster offset
+   */
+  getClusterOffset(): number {
+    return this.clusterOffset;
+  }
+
+  /**
+   * Check if adapter is fully initialized with MXE connection
+   */
+  isFullyInitialized(): boolean {
+    return this.arciumClient !== null && this.csplClient !== null;
+  }
+
+  /**
+   * Get mempool statistics
+   */
+  async getMempoolStats(): Promise<MempoolPriorityFeeStats | null> {
+    if (!this.arciumClient) {
+      return null;
+    }
+    return this.arciumClient.getMempoolPriorityFeeStats();
+  }
+
+  /**
+   * Apply pending confidential balance for a token
+   * Finalizes incoming confidential transfers
+   */
+  async applyPendingBalance(token: string): Promise<TransactionSignature | null> {
+    if (!this.csplClient) {
+      return null;
+    }
+
+    const tokenConfig = CSPL_TOKEN_CONFIGS[token.toUpperCase()];
+    if (!tokenConfig) {
+      throw new ArciumError(ArciumErrorType.InvalidInput, `Token ${token} not supported`);
+    }
+
+    return this.csplClient.applyPendingBalance(tokenConfig.mint);
   }
 }

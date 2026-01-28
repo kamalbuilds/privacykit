@@ -1,3 +1,21 @@
+/**
+ * ShadowWire/ShadowPay Adapter
+ *
+ * Production integration with the ShadowPay API for private transfers
+ * using Groth16 zero-knowledge proofs and ElGamal encryption on BN254.
+ *
+ * API Base URL: https://shadow.radr.fun/shadowpay/v1
+ * Documentation: https://registry.scalar.com/@radr/apis/shadowpay-api
+ * NPM Packages: @shadowpay/core, @shadowpay/server, @shadowpay/client
+ *
+ * Features:
+ * - Internal transfers: Amount hidden using ZK proofs
+ * - External transfers: Sender anonymous, amount visible
+ * - Supports SOL, USDC, USDT, RADR, BONK, and other SPL tokens
+ * - x402 payment protocol integration
+ * - ElGamal encryption for amount privacy
+ */
+
 import type {
   TransferRequest,
   TransferResult,
@@ -19,76 +37,75 @@ import {
   NetworkError,
   wrapError,
 } from '../utils/errors';
-import { toPublicKey, retry } from '../utils';
-import { getProviderFee, getMinimumAmount, toSmallestUnit, fromSmallestUnit } from '../types/tokens';
+import { retry } from '../utils';
+import { toSmallestUnit, fromSmallestUnit } from '../types/tokens';
+import {
+  ShadowPayApiClient,
+  ShadowPayApiErrorClass,
+  SHADOWPAY_TOKENS,
+  SHADOWPAY_API_URL,
+  API_VERSION,
+  createSignedMessage,
+  createTransferPayload,
+} from '../shadowwire';
+import { ShadowPayErrorCode } from '../shadowwire/types';
+import type {
+  PrivateTransferRequest,
+  PrivateTransferResponse,
+  BalanceResponse,
+  DepositResponse,
+  WithdrawalResponse,
+  TokenConfig,
+} from '../shadowwire/types';
 
 /**
- * ShadowWire API response types
+ * Extended token configuration with legacy support
+ * Includes tokens from the original adapter plus official ShadowPay tokens
  */
-interface ShadowWireBalanceResponse {
-  balance: number;
-  token: string;
-}
-
-interface ShadowWireTransferResponse {
-  success: boolean;
-  transactionId: string;
-  fee: number;
-  error?: string;
-}
-
-interface ShadowWireDepositResponse {
-  success: boolean;
-  transactionId: string;
-  commitment?: string;
-  error?: string;
-}
-
-interface ShadowWireWithdrawResponse {
-  success: boolean;
-  transactionId: string;
-  error?: string;
-}
-
-/**
- * ShadowWire token configuration
- */
-const SHADOWWIRE_TOKENS: Record<string, { decimals: number; fee: number; minAmount: number }> = {
-  SOL: { decimals: 9, fee: 0.005, minAmount: 0.01 },
-  RADR: { decimals: 9, fee: 0.003, minAmount: 0.1 },
-  USDC: { decimals: 6, fee: 0.01, minAmount: 1 },
-  ORE: { decimals: 11, fee: 0.003, minAmount: 0.001 },
-  BONK: { decimals: 5, fee: 0.01, minAmount: 100000 },
-  JIM: { decimals: 9, fee: 0.01, minAmount: 1 },
-  GODL: { decimals: 11, fee: 0.01, minAmount: 0.001 },
-  HUSTLE: { decimals: 9, fee: 0.003, minAmount: 0.1 },
-  ZEC: { decimals: 9, fee: 0.01, minAmount: 0.01 },
-  CRT: { decimals: 9, fee: 0.01, minAmount: 1 },
-  BLACKCOIN: { decimals: 6, fee: 0.01, minAmount: 1 },
-  GIL: { decimals: 6, fee: 0.01, minAmount: 1 },
-  ANON: { decimals: 9, fee: 0.01, minAmount: 1 },
-  WLFI: { decimals: 6, fee: 0.01, minAmount: 1 },
-  USD1: { decimals: 6, fee: 0.01, minAmount: 1 },
-  AOL: { decimals: 6, fee: 0.01, minAmount: 1 },
-  IQLABS: { decimals: 9, fee: 0.005, minAmount: 0.1 },
-  SANA: { decimals: 6, fee: 0.01, minAmount: 1 },
-  POKI: { decimals: 9, fee: 0.01, minAmount: 1 },
-  RAIN: { decimals: 6, fee: 0.02, minAmount: 1 },
-  HOSICO: { decimals: 9, fee: 0.01, minAmount: 1 },
-  SKR: { decimals: 6, fee: 0.005, minAmount: 1 },
+const EXTENDED_TOKENS: Record<string, TokenConfig> = {
+  ...SHADOWPAY_TOKENS,
+  // Additional tokens from legacy configuration
+  JIM: { symbol: 'JIM', decimals: 9, fee: 0.01, minAmount: 1 },
+  GODL: { symbol: 'GODL', decimals: 11, fee: 0.01, minAmount: 0.001 },
+  HUSTLE: { symbol: 'HUSTLE', decimals: 9, fee: 0.003, minAmount: 0.1 },
+  ZEC: { symbol: 'ZEC', decimals: 9, fee: 0.01, minAmount: 0.01 },
+  CRT: { symbol: 'CRT', decimals: 9, fee: 0.01, minAmount: 1 },
+  BLACKCOIN: { symbol: 'BLACKCOIN', decimals: 6, fee: 0.01, minAmount: 1 },
+  GIL: { symbol: 'GIL', decimals: 6, fee: 0.01, minAmount: 1 },
+  ANON: { symbol: 'ANON', decimals: 9, fee: 0.01, minAmount: 1 },
+  WLFI: { symbol: 'WLFI', decimals: 6, fee: 0.01, minAmount: 1 },
+  USD1: { symbol: 'USD1', decimals: 6, fee: 0.01, minAmount: 1 },
+  AOL: { symbol: 'AOL', decimals: 6, fee: 0.01, minAmount: 1 },
+  IQLABS: { symbol: 'IQLABS', decimals: 9, fee: 0.005, minAmount: 0.1 },
+  SANA: { symbol: 'SANA', decimals: 6, fee: 0.01, minAmount: 1 },
+  POKI: { symbol: 'POKI', decimals: 9, fee: 0.01, minAmount: 1 },
+  RAIN: { symbol: 'RAIN', decimals: 6, fee: 0.02, minAmount: 1 },
+  HOSICO: { symbol: 'HOSICO', decimals: 9, fee: 0.01, minAmount: 1 },
+  SKR: { symbol: 'SKR', decimals: 6, fee: 0.005, minAmount: 1 },
 };
 
 /**
  * ShadowWire Adapter
  *
- * Real production integration with ShadowWire API for private transfers
- * using Bulletproof zero-knowledge proofs.
+ * Real production integration with ShadowPay API for private transfers
+ * using Groth16 ZK-SNARKs and ElGamal encryption.
  *
- * Features:
- * - Internal transfers: Amount hidden using ZK proofs
- * - External transfers: Sender anonymous, amount visible
- * - Supports 22+ tokens
- * - Client-side proof generation option
+ * @example
+ * ```typescript
+ * const adapter = new ShadowWireAdapter();
+ * await adapter.initialize(connection, wallet);
+ *
+ * // Execute a private transfer (amount hidden)
+ * const result = await adapter.transfer({
+ *   recipient: 'recipient_address',
+ *   amount: 1.0,
+ *   token: 'SOL',
+ *   privacy: PrivacyLevel.AMOUNT_HIDDEN
+ * });
+ *
+ * // Get shielded balance
+ * const balance = await adapter.getBalance('SOL');
+ * ```
  */
 export class ShadowWireAdapter extends BaseAdapter {
   readonly provider = PrivacyProvider.SHADOWWIRE;
@@ -97,39 +114,72 @@ export class ShadowWireAdapter extends BaseAdapter {
     PrivacyLevel.AMOUNT_HIDDEN,
     PrivacyLevel.SENDER_HIDDEN,
   ];
-  readonly supportedTokens = Object.keys(SHADOWWIRE_TOKENS);
+  readonly supportedTokens = Object.keys(EXTENDED_TOKENS);
 
-  private apiBaseUrl = 'https://api.radr.fun';
-  private wasmInitialized = false;
+  private apiClient: ShadowPayApiClient;
+  private apiBaseUrl = SHADOWPAY_API_URL;
+  private apiKey?: string;
+
+  constructor(apiKey?: string) {
+    super();
+    this.apiKey = apiKey;
+    this.apiClient = new ShadowPayApiClient({
+      apiKey,
+      apiUrl: this.apiBaseUrl,
+    });
+  }
 
   /**
    * Initialize ShadowWire adapter
+   * Verifies API connectivity
    */
   protected async onInitialize(): Promise<void> {
-    // Verify API is reachable
     try {
-      const response = await fetch(`${this.apiBaseUrl}/health`, {
-        method: 'GET',
-        headers: { 'Content-Type': 'application/json' },
-      });
-
-      if (!response.ok) {
-        this.logger.warn('ShadowWire API health check failed, will retry on operations');
+      const health = await this.apiClient.health();
+      if (health.status !== 'ok') {
+        this.logger.warn('ShadowPay API health check returned non-ok status');
+      } else {
+        this.logger.info('ShadowPay API connection verified');
       }
     } catch (error) {
-      this.logger.warn('Could not reach ShadowWire API during init, will retry on operations');
+      this.logger.warn('Could not verify ShadowPay API connectivity, will retry on operations');
     }
   }
 
   /**
-   * Configure API base URL (useful for testing)
+   * Configure API base URL (useful for testing or custom deployments)
    */
   setApiUrl(url: string): void {
     this.apiBaseUrl = url;
+    this.apiClient = new ShadowPayApiClient({
+      apiKey: this.apiKey,
+      apiUrl: url,
+    });
+  }
+
+  /**
+   * Set API key for authenticated requests
+   */
+  setApiKey(apiKey: string): void {
+    this.apiKey = apiKey;
+    this.apiClient = new ShadowPayApiClient({
+      apiKey,
+      apiUrl: this.apiBaseUrl,
+    });
+  }
+
+  /**
+   * Get token configuration
+   */
+  private getTokenConfig(token: string): TokenConfig | undefined {
+    return EXTENDED_TOKENS[token.toUpperCase()];
   }
 
   /**
    * Get balance for a token in the ShadowWire privacy pool
+   *
+   * Note: The ShadowPay API may not expose a direct balance endpoint.
+   * Balance queries may need to be done via on-chain program state.
    */
   async getBalance(token: string, address?: string): Promise<number> {
     this.ensureReady();
@@ -140,46 +190,48 @@ export class ShadowWireAdapter extends BaseAdapter {
     }
 
     const normalizedToken = token.toUpperCase();
-    if (!SHADOWWIRE_TOKENS[normalizedToken]) {
+    const tokenConfig = this.getTokenConfig(normalizedToken);
+    if (!tokenConfig) {
       throw new Error(`Token ${token} not supported by ShadowWire`);
     }
 
     try {
       const response = await retry(
         async () => {
-          const res = await fetch(
-            `${this.apiBaseUrl}/v1/balance/${walletAddress}?token=${normalizedToken}`,
-            {
-              method: 'GET',
-              headers: { 'Content-Type': 'application/json' },
+          try {
+            return await this.apiClient.getBalance(walletAddress, normalizedToken);
+          } catch (error) {
+            // If balance endpoint returns 404, return 0 balance
+            if (error instanceof ShadowPayApiErrorClass && error.status === 404) {
+              return { balance: 0, token: normalizedToken };
             }
-          );
-
-          if (!res.ok) {
-            const error = await res.text();
-            throw new NetworkError(`Failed to get balance: ${error}`);
+            throw error;
           }
-
-          return res.json() as Promise<ShadowWireBalanceResponse>;
         },
         { maxRetries: 3 }
       );
 
       return response.balance;
     } catch (error) {
+      if (error instanceof ShadowPayApiErrorClass) {
+        throw new NetworkError(`Failed to get balance: ${error.message}`, error);
+      }
       throw wrapError(error, 'Failed to get ShadowWire balance');
     }
   }
 
   /**
-   * Execute a private transfer via ShadowWire
+   * Execute a private transfer via ShadowPay
+   *
+   * Internal transfers (AMOUNT_HIDDEN): Amount encrypted with ElGamal
+   * External transfers (SENDER_HIDDEN): Sender identity protected
    */
   async transfer(request: TransferRequest): Promise<TransferResult> {
     this.ensureReady();
     const wallet = this.ensureWallet();
 
     const token = request.token.toUpperCase();
-    const tokenConfig = SHADOWWIRE_TOKENS[token];
+    const tokenConfig = this.getTokenConfig(token);
 
     if (!tokenConfig) {
       throw new Error(`Token ${request.token} not supported by ShadowWire`);
@@ -207,55 +259,57 @@ export class ShadowWireAdapter extends BaseAdapter {
     this.logger.info(`Initiating ${transferType} transfer of ${request.amount} ${token}`);
 
     try {
-      // Create the transfer request message for signing
+      // Create and sign the transfer payload
       const timestamp = Date.now();
-      const message = new TextEncoder().encode(
-        JSON.stringify({
-          action: 'transfer',
-          sender: wallet.publicKey.toBase58(),
-          recipient,
-          amount: request.amount,
-          token,
-          type: transferType,
-          timestamp,
-        })
-      );
+      const payload = createTransferPayload({
+        action: 'transfer',
+        sender: wallet.publicKey.toBase58(),
+        recipient,
+        amount: request.amount,
+        token,
+        type: transferType,
+        timestamp,
+      });
 
-      // Sign the message with wallet
-      const signature = await wallet.signMessage(message);
+      const { signature } = await createSignedMessage(wallet, payload);
 
-      // Execute the transfer via API
+      // Build transfer request
+      const transferRequest: PrivateTransferRequest = {
+        sender: wallet.publicKey.toBase58(),
+        recipient,
+        amount: request.amount,
+        token,
+        type: transferType,
+        timestamp,
+        signature,
+      };
+
+      // Execute the transfer via API with retry
       const response = await retry(
         async () => {
-          const res = await fetch(`${this.apiBaseUrl}/v1/transfer`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              sender: wallet.publicKey.toBase58(),
-              recipient,
-              amount: request.amount,
-              token,
-              type: transferType,
-              timestamp,
-              signature: Buffer.from(signature).toString('base64'),
-              ...(request.options?.customProof && {
-                customProof: Buffer.from(request.options.customProof).toString('base64'),
-              }),
-            }),
-          });
-
-          if (!res.ok) {
-            const errorData = await res.json().catch(() => ({ error: 'Unknown error' }));
-            if (errorData.error?.includes('not found')) {
-              throw new RecipientNotFoundError(recipient);
+          try {
+            return await this.apiClient.transfer(transferRequest);
+          } catch (error) {
+            if (error instanceof ShadowPayApiErrorClass) {
+              // Map API errors to SDK errors
+              switch (error.code) {
+                case ShadowPayErrorCode.INVALID_RECIPIENT:
+                  throw new RecipientNotFoundError(recipient);
+                case ShadowPayErrorCode.INSUFFICIENT_BALANCE:
+                  throw new InsufficientBalanceError(request.amount, 0, token);
+                case ShadowPayErrorCode.AMOUNT_BELOW_MINIMUM:
+                  throw new AmountBelowMinimumError(
+                    request.amount,
+                    tokenConfig.minAmount,
+                    token,
+                    this.provider
+                  );
+                default:
+                  throw new TransactionError(error.message);
+              }
             }
-            if (errorData.error?.includes('insufficient')) {
-              throw new InsufficientBalanceError(request.amount, 0, token);
-            }
-            throw new TransactionError(errorData.error || 'Transfer failed');
+            throw error;
           }
-
-          return res.json() as Promise<ShadowWireTransferResponse>;
         },
         { maxRetries: 2 }
       );
@@ -264,18 +318,21 @@ export class ShadowWireAdapter extends BaseAdapter {
         throw new TransactionError(response.error || 'Transfer failed');
       }
 
-      this.logger.info(`Transfer complete: ${response.transactionId}`);
+      this.logger.info(`Transfer complete: ${response.transactionId || response.signature}`);
 
       return {
-        signature: response.transactionId,
+        signature: response.transactionId || response.signature || '',
         provider: this.provider,
         privacyLevel: request.privacy,
         fee: response.fee || request.amount * tokenConfig.fee,
       };
     } catch (error) {
-      if (error instanceof InsufficientBalanceError ||
-          error instanceof RecipientNotFoundError ||
-          error instanceof TransactionError) {
+      if (
+        error instanceof InsufficientBalanceError ||
+        error instanceof RecipientNotFoundError ||
+        error instanceof TransactionError ||
+        error instanceof AmountBelowMinimumError
+      ) {
         throw error;
       }
       throw wrapError(error, 'ShadowWire transfer failed');
@@ -290,7 +347,7 @@ export class ShadowWireAdapter extends BaseAdapter {
     const wallet = this.ensureWallet();
 
     const token = request.token.toUpperCase();
-    const tokenConfig = SHADOWWIRE_TOKENS[token];
+    const tokenConfig = this.getTokenConfig(token);
 
     if (!tokenConfig) {
       throw new Error(`Token ${request.token} not supported by ShadowWire`);
@@ -309,38 +366,28 @@ export class ShadowWireAdapter extends BaseAdapter {
 
     try {
       const timestamp = Date.now();
-      const message = new TextEncoder().encode(
-        JSON.stringify({
-          action: 'deposit',
-          wallet: wallet.publicKey.toBase58(),
-          amount: request.amount,
-          token,
-          timestamp,
-        })
-      );
+      const payload = createTransferPayload({
+        action: 'deposit',
+        sender: wallet.publicKey.toBase58(),
+        amount: request.amount,
+        token,
+        timestamp,
+      });
 
-      const signature = await wallet.signMessage(message);
+      const { signature } = await createSignedMessage(wallet, payload);
+
+      // Convert to smallest units for API
+      const amountSmallest = toSmallestUnit(request.amount, token).toString();
 
       const response = await retry(
         async () => {
-          const res = await fetch(`${this.apiBaseUrl}/v1/deposit`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              wallet: wallet.publicKey.toBase58(),
-              amount: toSmallestUnit(request.amount, token).toString(),
-              token,
-              timestamp,
-              signature: Buffer.from(signature).toString('base64'),
-            }),
+          return await this.apiClient.deposit({
+            wallet: wallet.publicKey.toBase58(),
+            amount: amountSmallest,
+            token,
+            timestamp,
+            signature,
           });
-
-          if (!res.ok) {
-            const errorData = await res.json().catch(() => ({ error: 'Unknown error' }));
-            throw new TransactionError(errorData.error || 'Deposit failed');
-          }
-
-          return res.json() as Promise<ShadowWireDepositResponse>;
         },
         { maxRetries: 2 }
       );
@@ -349,16 +396,18 @@ export class ShadowWireAdapter extends BaseAdapter {
         throw new TransactionError(response.error || 'Deposit failed');
       }
 
-      this.logger.info(`Deposit complete: ${response.transactionId}`);
+      this.logger.info(`Deposit complete: ${response.transactionId || response.signature}`);
 
       return {
-        signature: response.transactionId,
+        signature: response.transactionId || response.signature || '',
         provider: this.provider,
         commitment: response.commitment,
-        fee: request.amount * tokenConfig.fee,
+        fee: response.fee || request.amount * tokenConfig.fee,
       };
     } catch (error) {
-      if (error instanceof TransactionError) throw error;
+      if (error instanceof TransactionError || error instanceof AmountBelowMinimumError) {
+        throw error;
+      }
       throw wrapError(error, 'ShadowWire deposit failed');
     }
   }
@@ -371,7 +420,7 @@ export class ShadowWireAdapter extends BaseAdapter {
     const wallet = this.ensureWallet();
 
     const token = request.token.toUpperCase();
-    const tokenConfig = SHADOWWIRE_TOKENS[token];
+    const tokenConfig = this.getTokenConfig(token);
 
     if (!tokenConfig) {
       throw new Error(`Token ${request.token} not supported by ShadowWire`);
@@ -386,40 +435,30 @@ export class ShadowWireAdapter extends BaseAdapter {
 
     try {
       const timestamp = Date.now();
-      const message = new TextEncoder().encode(
-        JSON.stringify({
-          action: 'withdraw',
-          wallet: wallet.publicKey.toBase58(),
-          recipient,
-          amount: request.amount,
-          token,
-          timestamp,
-        })
-      );
+      const payload = createTransferPayload({
+        action: 'withdraw',
+        sender: wallet.publicKey.toBase58(),
+        recipient,
+        amount: request.amount,
+        token,
+        timestamp,
+      });
 
-      const signature = await wallet.signMessage(message);
+      const { signature } = await createSignedMessage(wallet, payload);
+
+      // Convert to smallest units for API
+      const amountSmallest = toSmallestUnit(request.amount, token).toString();
 
       const response = await retry(
         async () => {
-          const res = await fetch(`${this.apiBaseUrl}/v1/withdraw`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              wallet: wallet.publicKey.toBase58(),
-              recipient,
-              amount: toSmallestUnit(request.amount, token).toString(),
-              token,
-              timestamp,
-              signature: Buffer.from(signature).toString('base64'),
-            }),
+          return await this.apiClient.withdraw({
+            wallet: wallet.publicKey.toBase58(),
+            recipient,
+            amount: amountSmallest,
+            token,
+            timestamp,
+            signature,
           });
-
-          if (!res.ok) {
-            const errorData = await res.json().catch(() => ({ error: 'Unknown error' }));
-            throw new TransactionError(errorData.error || 'Withdrawal failed');
-          }
-
-          return res.json() as Promise<ShadowWireWithdrawResponse>;
         },
         { maxRetries: 2 }
       );
@@ -428,15 +467,17 @@ export class ShadowWireAdapter extends BaseAdapter {
         throw new TransactionError(response.error || 'Withdrawal failed');
       }
 
-      this.logger.info(`Withdrawal complete: ${response.transactionId}`);
+      this.logger.info(`Withdrawal complete: ${response.transactionId || response.signature}`);
 
       return {
-        signature: response.transactionId,
+        signature: response.transactionId || response.signature || '',
         provider: this.provider,
-        fee: request.amount * tokenConfig.fee,
+        fee: response.fee || request.amount * tokenConfig.fee,
       };
     } catch (error) {
-      if (error instanceof TransactionError) throw error;
+      if (error instanceof TransactionError) {
+        throw error;
+      }
       throw wrapError(error, 'ShadowWire withdrawal failed');
     }
   }
@@ -446,7 +487,7 @@ export class ShadowWireAdapter extends BaseAdapter {
    */
   async estimate(request: EstimateRequest): Promise<EstimateResult> {
     const token = (request.token || 'SOL').toUpperCase();
-    const tokenConfig = SHADOWWIRE_TOKENS[token];
+    const tokenConfig = this.getTokenConfig(token);
 
     if (!tokenConfig) {
       return {
@@ -470,6 +511,7 @@ export class ShadowWireAdapter extends BaseAdapter {
     }
 
     // Estimate latency based on operation type
+    // Internal transfers with ZK proofs take longer
     let latencyMs = 3000; // Base latency
     if (request.operation === 'transfer') {
       latencyMs = request.privacy === PrivacyLevel.AMOUNT_HIDDEN ? 5000 : 3000;
@@ -491,7 +533,7 @@ export class ShadowWireAdapter extends BaseAdapter {
    * Get fee percentage for a token
    */
   getFeePercentage(token: string): number {
-    const config = SHADOWWIRE_TOKENS[token.toUpperCase()];
+    const config = this.getTokenConfig(token.toUpperCase());
     return config?.fee || 0.01;
   }
 
@@ -499,7 +541,7 @@ export class ShadowWireAdapter extends BaseAdapter {
    * Get minimum amount for a token
    */
   getMinimumAmount(token: string): number {
-    const config = SHADOWWIRE_TOKENS[token.toUpperCase()];
+    const config = this.getTokenConfig(token.toUpperCase());
     return config?.minAmount || 0;
   }
 
@@ -517,5 +559,16 @@ export class ShadowWireAdapter extends BaseAdapter {
       netAmount: amount - fee,
       feePercent,
     };
+  }
+
+  /**
+   * Verify a payment access token
+   * Used for x402 payment protocol integration
+   */
+  async verifyPayment(
+    accessToken: string,
+    requirement?: { amount: number; token: string }
+  ): Promise<{ authorized: boolean; status: string }> {
+    return this.apiClient.verifyPayment(accessToken, requirement);
   }
 }
