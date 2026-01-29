@@ -50,12 +50,7 @@
     "privacycash:circuits": "echo 'See src/privacycash/circuits/README.md for circuit compilation instructions'"
   },
   "dependencies": {
-    "@arcium-hq/client": "^0.2.0",
-    "@arcium-hq/reader": "^0.2.0",
     "@coral-xyz/anchor": "^0.30.0",
-    "@noir-lang/backend_barretenberg": "^0.30.0",
-    "@noir-lang/noir_js": "^0.30.0",
-    "@noir-lang/types": "^0.30.0",
     "@solana/spl-token": "^0.4.0",
     "@solana/web3.js": "^1.95.0",
     "@radr/shadowwire": "^1.0.0",
@@ -77,8 +72,10 @@
     "@solana/web3.js": "^1.90.0"
   },
   "optionalDependencies": {
-    "circomlibjs": "^0.1.7",
-    "snarkjs": "^0.7.4"
+    "@arcium-hq/client": "^0.2.0",
+    "@arcium-hq/reader": "^0.2.0",
+    "@noir-lang/backend_barretenberg": "^0.38.0",
+    "@noir-lang/noir_js": "^0.38.0"
   },
   "keywords": [
     "solana",

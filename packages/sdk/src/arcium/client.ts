@@ -66,7 +66,7 @@ const ACCOUNT_SEEDS = {
  * Fee pool account address (constant across all clusters)
  */
 const ARCIUM_FEE_POOL_ACCOUNT_ADDRESS = new PublicKey(
-  'FeePooo1Arcium1111111111111111111111111111111'
+  'D9EsDZNv3KwQELWiygFWkx3yMiCFsv8TupDMgSs5tDQM'
 );
 
 /**

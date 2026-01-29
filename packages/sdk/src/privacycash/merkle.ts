@@ -208,12 +208,12 @@ export class IncrementalMerkleTree {
 
       // Get sibling value
       let sibling: bigint;
-      if (siblingIndex < Math.pow(2, level) && siblingIndex < this.leaves.length) {
-        // Sibling is a real leaf or computed node
-        sibling = await this.getNodeAtLevel(siblingIndex, level);
+      // For level 0, check against number of leaves
+      // For higher levels, the sibling might be a computed node or zero
+      if (level === 0) {
+        sibling = siblingIndex < this.leaves.length ? this.leaves[siblingIndex] : this.zeros[0];
       } else {
-        // Sibling is a zero value
-        sibling = this.zeros[level];
+        sibling = await this.getNodeAtLevel(siblingIndex, level);
       }
 
       pathElements.push(sibling);
@@ -241,6 +241,14 @@ export class IncrementalMerkleTree {
 
     const leftChildIndex = index * 2;
     const rightChildIndex = index * 2 + 1;
+
+    // Calculate how many nodes exist at this level based on number of leaves
+    const nodesAtPrevLevel = Math.ceil(this.nextIndex / Math.pow(2, level - 1));
+
+    // If the left child index is beyond what we have, return zero for this level
+    if (leftChildIndex >= nodesAtPrevLevel) {
+      return this.zeros[level];
+    }
 
     const left = await this.getNodeAtLevel(leftChildIndex, level - 1);
     const right = await this.getNodeAtLevel(rightChildIndex, level - 1);

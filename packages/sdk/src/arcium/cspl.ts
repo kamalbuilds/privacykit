@@ -48,15 +48,15 @@ import { ArciumEncryption, serializeLE, deserializeLE } from './encryption';
  */
 export const CSPL_PROGRAM_IDS = {
   /** Confidential Transfer Adapter - extends Token-2022 for on-chain program support */
-  confidentialTransferAdapter: new PublicKey('CtfAdp1111111111111111111111111111111111111'),
+  confidentialTransferAdapter: new PublicKey('8ot7ugPZifAd2pDyq2M118QzFKgJrHKHBwCscHbiiSvM'),
   /** Encrypted SPL Token - lightweight confidential token implementation */
-  encryptedSplToken: new PublicKey('EncSPL11111111111111111111111111111111111'),
+  encryptedSplToken: new PublicKey('GUDjGmajhtENqyih8p2pz5NaKbNFk7dsS6k5TrX7kyRh'),
   /** Confidential Auditor Adapter - programmable compliance */
-  confidentialAuditorAdapter: new PublicKey('AudAdp11111111111111111111111111111111111'),
+  confidentialAuditorAdapter: new PublicKey('48nWF8oac4GcjyT19k7HbgcTjHEdfhsVAKq5eRxYpmEB'),
   /** Confidential ATA Program - associated token accounts for confidential tokens */
-  confidentialAta: new PublicKey('CtfATA11111111111111111111111111111111111'),
+  confidentialAta: new PublicKey('HTwgGkQGGZBJQFg1EUGm1aSmi3G9MhBKbaLpRhnP6JGi'),
   /** Token Wrap Program - wrapping SPL tokens to confidential variants */
-  tokenWrap: new PublicKey('TokWrp11111111111111111111111111111111111'),
+  tokenWrap: new PublicKey('YkdjzjDqWQ3khsojNZEGgoivbthWyty3YgnPur6sQAW'),
 } as const;
 
 /**
